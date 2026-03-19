@@ -233,7 +233,7 @@ async def handle_yk_payment(q, uid: int, plan_label: str):
     try:
         payment = YKPayment.create({
             "amount": {"value": f"{plan['price']}.00", "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": f"https://t.me/{(await q.get_bot()).username}"},
+            "confirmation": {"type": "redirect", "return_url": f"https://t.me/{q.get_bot().username}",
             "capture": True,
             "description": f"Таро-бот: {plan['desc']} ({plan['name']})",
             "metadata": {"user_id": str(uid), "plan_label": plan_label},
