@@ -39,7 +39,7 @@ STATE_SPREAD_QUESTION = "spread_question"
 
 # ── Тарифы ЮKassa ────────────────────────────────────────────────────
 YK_PLANS = [
-    {"label": "yk_99",  "name": "🌙 Старт",       "price":  99, "requests":   3, "desc": "3 расклада"},
+    {"label": "yk_99",  "name": "🌙 Старт",       "price":  1, "requests":   3, "desc": "3 расклада"},
     {"label": "yk_249", "name": "⭐ Популярный",  "price": 249, "requests":  10, "desc": "10 раскладов"},
     {"label": "yk_499", "name": "🔥 Продвинутый", "price": 499, "requests":  25, "desc": "25 раскладов"},
     {"label": "yk_999", "name": "👑 VIP",          "price": 999, "requests": 100, "desc": "100 раскладов"},
