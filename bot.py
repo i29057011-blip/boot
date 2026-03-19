@@ -39,7 +39,7 @@ STATE_SPREAD_QUESTION = "spread_question"
 
 # ── Тарифы ЮKassa ────────────────────────────────────────────────────
 YK_PLANS = [
-    {"label": "yk_99",  "name": "🌙 Старт",       "price":  1, "requests":   3, "desc": "3 расклада"},
+    {"label": "yk_99",  "name": "🌙 Старт",       "price":  99, "requests":   3, "desc": "3 расклада"},
     {"label": "yk_249", "name": "⭐ Популярный",  "price": 249, "requests":  10, "desc": "10 раскладов"},
     {"label": "yk_499", "name": "🔥 Продвинутый", "price": 499, "requests":  25, "desc": "25 раскладов"},
     {"label": "yk_999", "name": "👑 VIP",          "price": 999, "requests": 100, "desc": "100 раскладов"},
@@ -48,10 +48,10 @@ YK_PLANS_BY_LABEL = {p["label"]: p for p in YK_PLANS}
 
 # ── Тарифы Telegram Stars ─────────────────────────────────────────────
 STARS_PLANS = [
-    {"label": "stars_1",  "name": "🌙 Пробный",     "stars":  1, "requests":  100, "desc": "Попробовать"},
-    {"label": "stars_5",  "name": "⭐ Популярный",  "stars":  5, "requests":  500, "desc": "Лучший выбор"},
-    {"label": "stars_15", "name": "🔥 Продвинутый", "stars": 15, "requests": 1500, "desc": "Серьёзная работа"},
-    {"label": "stars_50", "name": "👑 VIP",          "stars": 50, "requests": 5000, "desc": "Без ограничений"},
+    {"label": "stars_1",  "name": "🌙 Пробный",     "stars":  80, "requests":  3, "desc": "Попробовать"},
+    {"label": "stars_5",  "name": "⭐ Популярный",  "stars":  190, "requests":  10, "desc": "Лучший выбор"},
+    {"label": "stars_15", "name": "🔥 Продвинутый", "stars": 380, "requests": 25, "desc": "Серьёзная работа"},
+    {"label": "stars_50", "name": "👑 VIP",          "stars": 700, "requests": 100, "desc": "Без ограничений"},
 ]
 STARS_PLANS_BY_LABEL = {p["label"]: p for p in STARS_PLANS}
 
