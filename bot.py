@@ -224,36 +224,68 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_yk_payment(q, uid: int, plan_label: str):
     plan = YK_PLANS_BY_LABEL.get(plan_label)
-    if not plan: await q.answer("План не найден", show_alert=True); return
+    if not plan:
+        await q.answer("План не найден", show_alert=True)
+        return
     if not YK_SHOP_ID or not YK_SECRET:
         await q.edit_message_text(
             "⚠️ Оплата картой временно недоступна. Воспользуйтесь Telegram Stars.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Оплатить Stars", callback_data="sub_stars")],[InlineKeyboardButton("◀️ Назад", callback_data="subscribe")]]),
-            parse_mode=ParseMode.MARKDOWN); return
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ Оплатить Stars", callback_data="sub_stars")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="subscribe")],
+            ]),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
     try:
-        payment = YKPayment.create({
-            "amount": {"value": f"{plan['price']}.00", "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": f"https://t.me/{q.get_bot().username}",
+        bot_username = q.message.get_bot().username
+        idempotence_key = str(uuid.uuid4())
+        payment_data = {
+            "amount": {
+                "value": f"{plan['price']}.00",
+                "currency": "RUB",
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": f"https://t.me/{bot_username}",
+            },
             "capture": True,
             "description": f"Таро-бот: {plan['desc']} ({plan['name']})",
-            "metadata": {"user_id": str(uid), "plan_label": plan_label},
-        }, str(uuid.uuid4()))
-        db.save_pending_payment(payment_id=payment.id, telegram_id=uid, plan_label=plan_label)
+            "metadata": {
+                "user_id": str(uid),
+                "plan_label": plan_label,
+            },
+        }
+        payment = YKPayment.create(payment_data, idempotence_key)
+        db.save_pending_payment(
+            payment_id=payment.id,
+            telegram_id=uid,
+            plan_label=plan_label,
+        )
         pay_url = payment.confirmation.confirmation_url
         await q.edit_message_text(
-            f"💳 *{plan['name']}*\n\nСумма: *{plan['price']} ₽*\nВы получите: *{plan['requests']} запросов*\n\n"
-            "Нажмите кнопку, оплатите и вернитесь в бот.\nЗапросы зачислятся *автоматически* 🔮",
+            f"💳 *{plan['name']}*\n\n"
+            f"Сумма: *{plan['price']} ₽*\n"
+            f"Вы получите: *{plan['requests']} запросов*\n\n"
+            "Нажмите кнопку, оплатите и вернитесь в бот.\n"
+            "Запросы зачислятся *автоматически* 🔮",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Перейти к оплате", url=pay_url)],
                 [InlineKeyboardButton("◀️ Назад", callback_data="sub_yookassa")],
-            ]), parse_mode=ParseMode.MARKDOWN)
+            ]),
+            parse_mode=ParseMode.MARKDOWN,
+        )
         logger.info(f"YK payment created: {payment.id} user={uid} plan={plan_label}")
     except Exception as e:
         logger.error(f"YooKassa create error: {e}")
         await q.edit_message_text(
             "⚠️ Не удалось создать платёж. Попробуйте позже или оплатите Stars.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Stars", callback_data="sub_stars")],[InlineKeyboardButton("◀️ Назад", callback_data="subscribe")]]),
-            parse_mode=ParseMode.MARKDOWN)
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ Stars", callback_data="sub_stars")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="subscribe")],
+            ]),
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 # ─────────────────────────── ЮKassa webhook ──────────────────────────
 
