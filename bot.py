@@ -1,53 +1,61 @@
 import os
 import logging
-import random
-from datetime import datetime
+import uuid
 import pytz
+from aiohttp import web
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
 )
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    PreCheckoutQueryHandler,
-    filters,
-    ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, PreCheckoutQueryHandler, filters, ContextTypes,
 )
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
+from yookassa import Configuration, Payment as YKPayment
 import database as db
 import groq_client
-from tarot_cards import TAROT_CARDS, SPREADS, draw_cards, format_cards_text
+from tarot_cards import SPREADS, draw_cards, format_cards_text
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s — %(name)s — %(levelname)s — %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-MOSCOW_TZ = pytz.timezone("Europe/Moscow")
+TOKEN        = os.getenv("TELEGRAM_TOKEN")
+MOSCOW_TZ    = pytz.timezone("Europe/Moscow")
+YK_SHOP_ID   = os.getenv("YOOKASSA_SHOP_ID", "")
+YK_SECRET    = os.getenv("YOOKASSA_SECRET_KEY", "")
+WEBHOOK_PORT = int(os.getenv("PORT", 8080))
 
-STATE_IDLE = "idle"
-STATE_ASK_QUESTION = "ask_question"
+if YK_SHOP_ID and YK_SECRET:
+    Configuration.account_id = YK_SHOP_ID
+    Configuration.secret_key  = YK_SECRET
+
+STATE_IDLE            = "idle"
+STATE_ASK_QUESTION    = "ask_question"
 STATE_SPREAD_QUESTION = "spread_question"
 
+# ── Тарифы ЮKassa ────────────────────────────────────────────────────
+YK_PLANS = [
+    {"label": "yk_99",  "name": "🌙 Старт",       "price":  99, "requests":   3, "desc": "3 расклада"},
+    {"label": "yk_249", "name": "⭐ Популярный",  "price": 249, "requests":  10, "desc": "10 раскладов"},
+    {"label": "yk_499", "name": "🔥 Продвинутый", "price": 499, "requests":  25, "desc": "25 раскладов"},
+    {"label": "yk_999", "name": "👑 VIP",          "price": 999, "requests": 100, "desc": "100 раскладов"},
+]
+YK_PLANS_BY_LABEL = {p["label"]: p for p in YK_PLANS}
+
+# ── Тарифы Telegram Stars ─────────────────────────────────────────────
 STARS_PLANS = [
-    {"label": "stars_1",  "name": "🌙 Пробный",      "stars": 1,  "requests": 100,  "desc": "Идеально для знакомства"},
-    {"label": "stars_5",  "name": "⭐ Популярный",   "stars": 5,  "requests": 500,  "desc": "Лучший выбор"},
-    {"label": "stars_15", "name": "🔥 Продвинутый",  "stars": 15, "requests": 1500, "desc": "Для серьёзной работы"},
-    {"label": "stars_50", "name": "👑 VIP",           "stars": 50, "requests": 5000, "desc": "Безграничные возможности"},
+    {"label": "stars_1",  "name": "🌙 Пробный",     "stars":  1, "requests":  100, "desc": "Попробовать"},
+    {"label": "stars_5",  "name": "⭐ Популярный",  "stars":  5, "requests":  500, "desc": "Лучший выбор"},
+    {"label": "stars_15", "name": "🔥 Продвинутый", "stars": 15, "requests": 1500, "desc": "Серьёзная работа"},
+    {"label": "stars_50", "name": "👑 VIP",          "stars": 50, "requests": 5000, "desc": "Без ограничений"},
 ]
 STARS_PLANS_BY_LABEL = {p["label"]: p for p in STARS_PLANS}
 
+# ─────────────────────────── клавиатуры ──────────────────────────────
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -58,26 +66,32 @@ def main_menu_keyboard():
         [InlineKeyboardButton("ℹ️ Информация",         callback_data="info")],
     ])
 
-def back_to_menu_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]])
+def back_kb(): return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]])
+def cancel_kb(): return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]])
 
-def spreads_keyboard():
-    buttons = [[InlineKeyboardButton(s["name"], callback_data=f"spread_{k}")] for k, s in SPREADS.items()]
-    buttons.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
-    return InlineKeyboardMarkup(buttons)
+def spreads_kb():
+    b = [[InlineKeyboardButton(s["name"], callback_data=f"spread_{k}")] for k, s in SPREADS.items()]
+    b.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(b)
 
-def subscribe_keyboard():
-    buttons = [
-        [InlineKeyboardButton(
-            f"⭐ {p['stars']} звезд → {p['requests']} запросов  ({p['name']})",
-            callback_data=f"buy_stars_{p['label']}"
-        )]
-        for p in STARS_PLANS
-    ]
-    buttons.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
-    return InlineKeyboardMarkup(buttons)
+def subscribe_main_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Оплатить картой  (ЮKassa)", callback_data="sub_yookassa")],
+        [InlineKeyboardButton("⭐ Оплатить Telegram Stars",   callback_data="sub_stars")],
+        [InlineKeyboardButton("🏠 Главное меню",             callback_data="main_menu")],
+    ])
 
-def card_of_day_keyboard(pending_cards):
+def yk_plans_kb():
+    b = [[InlineKeyboardButton(f"{p['name']} — {p['price']}₽  ({p['desc']})", callback_data=f"buy_yk_{p['label']}")] for p in YK_PLANS]
+    b += [[InlineKeyboardButton("◀️ Назад", callback_data="subscribe")]]
+    return InlineKeyboardMarkup(b)
+
+def stars_plans_kb():
+    b = [[InlineKeyboardButton(f"⭐ {p['stars']} звезд → {p['requests']} запросов  ({p['name']})", callback_data=f"buy_stars_{p['label']}")] for p in STARS_PLANS]
+    b += [[InlineKeyboardButton("◀️ Назад", callback_data="subscribe")]]
+    return InlineKeyboardMarkup(b)
+
+def cod_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🂠 Карта 1", callback_data="pick_card_0"),
          InlineKeyboardButton("🂠 Карта 2", callback_data="pick_card_1"),
@@ -85,486 +99,402 @@ def card_of_day_keyboard(pending_cards):
         [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
     ])
 
-def cancel_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]])
-
+# ─────────────────────────── /start ──────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.get_or_create_user(telegram_id=user.id, username=user.username, first_name=user.first_name)
+    u = update.effective_user
+    db.get_or_create_user(telegram_id=u.id, username=u.username, first_name=u.first_name)
     context.user_data["state"] = STATE_IDLE
     await update.message.reply_text(
-        f"✨ *Добро пожаловать в Таро-бота, {user.first_name}!* ✨\n\n"
-        "Я — ваш персональный проводник в мире Таро. "
-        "Здесь вы найдёте ответы на важные вопросы, узнаете, что готовит судьба, "
-        "и получите мудрые советы от древних символов.\n\n"
+        f"✨ *Добро пожаловать в Таро-бота, {u.first_name}!* ✨\n\n"
+        "Я — ваш персональный проводник в мире Таро.\n\n"
         "🔮 *Что я умею:*\n"
-        "• Отвечать на ваши личные вопросы\n"
-        "• Делать глубокие расклады по разным темам\n"
-        "• Каждый день дарить вам карту дня\n"
-        "• Направлять и вдохновлять\n\n"
-        "💫 *Оплата* — только через Telegram Stars ⭐\n\n"
-        "Выберите действие в меню ниже 👇",
-        reply_markup=main_menu_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
+        "• Отвечать на личные вопросы через расклады\n"
+        "• Делать 10 видов тематических раскладов\n"
+        "• Каждый день дарить карту дня — бесплатно!\n\n"
+        "💳 *Оплата:* картой (ЮKassa) или Telegram Stars ⭐\n\n"
+        "Выберите действие 👇",
+        reply_markup=main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN,
     )
 
+# ─────────────────────────── callback handler ─────────────────────────
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
+async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+    uid = q.from_user.id
 
-    if data == "main_menu":
-        context.user_data["state"] = STATE_IDLE
+    if d == "main_menu":
+        context.user_data.update({"state": STATE_IDLE})
         context.user_data.pop("current_spread", None)
-        await query.edit_message_text(
-            "🏠 *Главное меню*\n\nВыберите действие:",
-            reply_markup=main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN,
-        )
+        await q.edit_message_text("🏠 *Главное меню*\n\nВыберите действие:", reply_markup=main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
-    elif data == "ask_question":
-        if not db.has_active_subscription(user_id):
-            await query.edit_message_text(
-                "🔒 *Нет активной подписки*\n\n"
-                "Оформите подписку за Telegram Stars, чтобы задавать вопросы.\n\n"
-                "Функция *«Задать вопрос»* позволяет:\n"
-                "• Ввести любой личный вопрос\n"
-                "• Получить расклад из трёх карт\n"
-                "• Узнать глубинный смысл в контексте вопроса",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⭐ Купить запросы", callback_data="subscribe")],
-                    [InlineKeyboardButton("🏠 Главное меню",   callback_data="main_menu")],
-                ]),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+    elif d == "ask_question":
+        if not db.has_active_subscription(uid):
+            await q.edit_message_text(
+                "🔒 *Нет активной подписки*\n\nОформите подписку, чтобы задавать вопросы.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe")],[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]]),
+                parse_mode=ParseMode.MARKDOWN)
             return
-        requests_left = db.get_requests_left(user_id)
         context.user_data["state"] = STATE_ASK_QUESTION
-        await query.edit_message_text(
-            f"🔮 *Задайте ваш вопрос*\n\nОсталось запросов: *{requests_left}*\n\n"
-            "Сформулируйте вопрос чётко и с намерением.\n\n💬 *Напишите ваш вопрос:*",
-            reply_markup=cancel_keyboard(), parse_mode=ParseMode.MARKDOWN,
-        )
+        await q.edit_message_text(
+            f"🔮 *Задайте ваш вопрос*\n\nОсталось запросов: *{db.get_requests_left(uid)}*\n\nНапишите ваш вопрос:",
+            reply_markup=cancel_kb(), parse_mode=ParseMode.MARKDOWN)
 
-    elif data == "spreads":
+    elif d == "spreads":
         context.user_data["state"] = STATE_IDLE
-        await query.edit_message_text(
-            "🎴 *Расклады Таро*\n\nВыберите тему расклада:",
-            reply_markup=spreads_keyboard(), parse_mode=ParseMode.MARKDOWN,
-        )
+        await q.edit_message_text("🎴 *Расклады Таро*\n\nВыберите тему:", reply_markup=spreads_kb(), parse_mode=ParseMode.MARKDOWN)
 
-    elif data.startswith("spread_"):
-        spread_key = data.replace("spread_", "")
-        if spread_key not in SPREADS:
-            await query.edit_message_text("Расклад не найден.", reply_markup=back_to_menu_keyboard())
-            return
-        spread = SPREADS[spread_key]
-        context.user_data["current_spread"] = spread_key
-        await query.edit_message_text(
-            f"{spread['emoji']} *{spread['name']}*\n\n_{spread['full_desc']}_\n\n{spread['how_to_ask']}",
+    elif d.startswith("spread_"):
+        key = d.replace("spread_", "")
+        if key not in SPREADS:
+            await q.edit_message_text("Расклад не найден.", reply_markup=back_kb()); return
+        s = SPREADS[key]; context.user_data["current_spread"] = key
+        await q.edit_message_text(
+            f"{s['emoji']} *{s['name']}*\n\n_{s['full_desc']}_\n\n{s['how_to_ask']}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎴 Начать расклад", callback_data=f"start_spread_{spread_key}")],
-                [InlineKeyboardButton("◀️ К раскладам",    callback_data="spreads")],
-                [InlineKeyboardButton("🏠 Главное меню",   callback_data="main_menu")],
-            ]),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+                [InlineKeyboardButton("🎴 Начать расклад", callback_data=f"start_spread_{key}")],
+                [InlineKeyboardButton("◀️ К раскладам", callback_data="spreads")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+            ]), parse_mode=ParseMode.MARKDOWN)
 
-    elif data.startswith("start_spread_"):
-        spread_key = data.replace("start_spread_", "")
-        if spread_key not in SPREADS:
-            await query.edit_message_text("Расклад не найден.", reply_markup=back_to_menu_keyboard())
-            return
-        if not db.has_active_subscription(user_id):
-            await query.edit_message_text(
-                "🔒 *Нет активной подписки*\n\nТемы раскладов доступны бесплатно, "
-                "а для проведения расклада нужна подписка.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⭐ Купить запросы", callback_data="subscribe")],
-                    [InlineKeyboardButton("◀️ Назад", callback_data=f"spread_{spread_key}")],
-                ]),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-        spread = SPREADS[spread_key]
-        requests_left = db.get_requests_left(user_id)
+    elif d.startswith("start_spread_"):
+        key = d.replace("start_spread_", "")
+        if key not in SPREADS:
+            await q.edit_message_text("Расклад не найден.", reply_markup=back_kb()); return
+        if not db.has_active_subscription(uid):
+            await q.edit_message_text(
+                "🔒 *Нет активной подписки*\n\nДля расклада нужна подписка.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Оформить", callback_data="subscribe")],[InlineKeyboardButton("◀️ Назад", callback_data=f"spread_{key}")]]),
+                parse_mode=ParseMode.MARKDOWN); return
         context.user_data["state"] = STATE_SPREAD_QUESTION
-        context.user_data["current_spread"] = spread_key
-        await query.edit_message_text(
-            f"🎴 *{spread['name']}*\n\nОсталось запросов: *{requests_left}*\n\n"
-            "Введите вопрос для этого расклада:\n\n💬 *Ваш вопрос:*",
-            reply_markup=cancel_keyboard(), parse_mode=ParseMode.MARKDOWN,
-        )
+        context.user_data["current_spread"] = key
+        await q.edit_message_text(
+            f"🎴 *{SPREADS[key]['name']}*\n\nОсталось: *{db.get_requests_left(uid)}* запросов\n\nВведите вопрос:",
+            reply_markup=cancel_kb(), parse_mode=ParseMode.MARKDOWN)
 
-    elif data == "subscribe":
-        requests_left = db.get_requests_left(user_id)
-        plans_text = "\n\n".join([
-            f"{'⭐' * min(p['stars'], 5)}{'…' if p['stars'] > 5 else ''} "
-            f"*{p['name']}* — {p['stars']} ⭐ → {p['requests']} запросов\n   _{p['desc']}_"
-            for p in STARS_PLANS
-        ])
-        await query.edit_message_text(
-            f"⭐ *Оплата через Telegram Stars*\n\n"
-            f"Ваш баланс: *{requests_left} запросов*\n\n"
+    # ── Подписка ───────────────────────────────────────────────────────
+    elif d == "subscribe":
+        rl = db.get_requests_left(uid)
+        await q.edit_message_text(
+            f"💳 *Оформление подписки*\n\nВаш баланс: *{rl} запросов*\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "💫 *Курс:* 1 звезда = 100 запросов\n\n"
-            f"{plans_text}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Запросы *накапливаются* и не сгорают.\n"
-            "Нажмите на план — откроется окно оплаты Telegram 👇",
-            reply_markup=subscribe_keyboard(), parse_mode=ParseMode.MARKDOWN,
-        )
+            "Выберите удобный способ оплаты:\n\n"
+            "💳 *ЮKassa* — Visa, МИР, SberPay, SBP и др.\n"
+            "⭐ *Telegram Stars* — внутренняя валюта Telegram",
+            reply_markup=subscribe_main_kb(), parse_mode=ParseMode.MARKDOWN)
 
-    elif data.startswith("buy_stars_"):
-        plan_label = data.replace("buy_stars_", "")
-        plan = STARS_PLANS_BY_LABEL.get(plan_label)
-        if not plan:
-            await query.answer("План не найден", show_alert=True)
-            return
-        await query.message.reply_invoice(
+    elif d == "sub_yookassa":
+        pt = "\n\n".join([f"*{p['name']}*\n{p['price']}₽ → {p['desc']}" for p in YK_PLANS])
+        await q.edit_message_text(
+            f"💳 *Оплата картой — ЮKassa*\n\n━━━━━━━━━━━━━━━━━━━━\n{pt}\n\n━━━━━━━━━━━━━━━━━━━━\n"
+            "После оплаты запросы зачислятся *автоматически*.",
+            reply_markup=yk_plans_kb(), parse_mode=ParseMode.MARKDOWN)
+
+    elif d.startswith("buy_yk_"):
+        await handle_yk_payment(q, uid, d.replace("buy_yk_", ""))
+
+    elif d == "sub_stars":
+        pt = "\n\n".join([f"*{p['name']}* — {p['stars']} ⭐ → {p['requests']} запросов\n_{p['desc']}_" for p in STARS_PLANS])
+        await q.edit_message_text(
+            f"⭐ *Оплата Telegram Stars*\n\n━━━━━━━━━━━━━━━━━━━━\n💫 1 звезда = 100 запросов\n\n{pt}\n\n━━━━━━━━━━━━━━━━━━━━\nЗапросы накапливаются и не сгорают.",
+            reply_markup=stars_plans_kb(), parse_mode=ParseMode.MARKDOWN)
+
+    elif d.startswith("buy_stars_"):
+        plan = STARS_PLANS_BY_LABEL.get(d.replace("buy_stars_", ""))
+        if not plan: await q.answer("План не найден", show_alert=True); return
+        await q.message.reply_invoice(
             title=f"{plan['name']} — {plan['requests']} запросов",
-            description=(
-                f"Таро-бот: {plan['requests']} запросов для раскладов.\n"
-                f"Курс: 1 ⭐ = 100 запросов. {plan['desc']}."
-            ),
-            payload=plan_label,
-            provider_token="",   # пустой = Stars
-            currency="XTR",      # Telegram Stars
+            description=f"Таро-бот: {plan['requests']} запросов. 1 ⭐ = 100 запросов.",
+            payload=plan["label"], provider_token="", currency="XTR",
             prices=[LabeledPrice(label=f"{plan['requests']} запросов", amount=plan["stars"])],
         )
 
-    elif data == "card_of_day":
-        await handle_card_of_day(query, user_id)
+    # ── Карта дня ──────────────────────────────────────────────────────
+    elif d == "card_of_day":
+        await handle_card_of_day(q, uid)
+    elif d.startswith("pick_card_"):
+        await handle_pick_card(q, uid, int(d.replace("pick_card_", "")))
 
-    elif data.startswith("pick_card_"):
-        card_index = int(data.replace("pick_card_", ""))
-        await handle_pick_card(query, user_id, card_index, context)
+    elif d == "info":
+        await handle_info(q)
 
-    elif data == "info":
-        await handle_info(query)
+# ─────────────────────────── ЮKassa: создание платежа ────────────────
 
+async def handle_yk_payment(q, uid: int, plan_label: str):
+    plan = YK_PLANS_BY_LABEL.get(plan_label)
+    if not plan: await q.answer("План не найден", show_alert=True); return
+    if not YK_SHOP_ID or not YK_SECRET:
+        await q.edit_message_text(
+            "⚠️ Оплата картой временно недоступна. Воспользуйтесь Telegram Stars.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Оплатить Stars", callback_data="sub_stars")],[InlineKeyboardButton("◀️ Назад", callback_data="subscribe")]]),
+            parse_mode=ParseMode.MARKDOWN); return
+    try:
+        payment = YKPayment.create({
+            "amount": {"value": f"{plan['price']}.00", "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": f"https://t.me/{(await q.get_bot()).username}"},
+            "capture": True,
+            "description": f"Таро-бот: {plan['desc']} ({plan['name']})",
+            "metadata": {"user_id": str(uid), "plan_label": plan_label},
+        }, str(uuid.uuid4()))
+        db.save_pending_payment(payment_id=payment.id, telegram_id=uid, plan_label=plan_label)
+        pay_url = payment.confirmation.confirmation_url
+        await q.edit_message_text(
+            f"💳 *{plan['name']}*\n\nСумма: *{plan['price']} ₽*\nВы получите: *{plan['requests']} запросов*\n\n"
+            "Нажмите кнопку, оплатите и вернитесь в бот.\nЗапросы зачислятся *автоматически* 🔮",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Перейти к оплате", url=pay_url)],
+                [InlineKeyboardButton("◀️ Назад", callback_data="sub_yookassa")],
+            ]), parse_mode=ParseMode.MARKDOWN)
+        logger.info(f"YK payment created: {payment.id} user={uid} plan={plan_label}")
+    except Exception as e:
+        logger.error(f"YooKassa create error: {e}")
+        await q.edit_message_text(
+            "⚠️ Не удалось создать платёж. Попробуйте позже или оплатите Stars.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Stars", callback_data="sub_stars")],[InlineKeyboardButton("◀️ Назад", callback_data="subscribe")]]),
+            parse_mode=ParseMode.MARKDOWN)
 
-# ── Telegram Stars: Pre-checkout (ОБЯЗАТЕЛЬНО ответить за 10 сек) ──
+# ─────────────────────────── ЮKassa webhook ──────────────────────────
 
-async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    plan = STARS_PLANS_BY_LABEL.get(query.invoice_payload)
-    if plan:
-        await query.answer(ok=True)
-        logger.info(f"Pre-checkout OK: user={query.from_user.id} plan={plan['label']}")
-    else:
-        await query.answer(ok=False, error_message="Неизвестный план подписки.")
+async def yookassa_webhook(request: web.Request) -> web.Response:
+    try: body = await request.json()
+    except Exception: return web.Response(status=400, text="Bad JSON")
 
+    event = body.get("event", "")
+    obj   = body.get("object", {})
+    logger.info(f"YK webhook: {event}  id={obj.get('id')}")
 
-# ── Telegram Stars: Успешная оплата — зачисляем запросы ────────────
+    if event != "payment.succeeded":
+        return web.Response(status=200, text="OK")
 
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payment = update.message.successful_payment
-    user_id = update.effective_user.id
-    plan_label = payment.invoice_payload
-    stars_paid = payment.total_amount  # для XTR == количество звёзд
+    payment_id = obj.get("id")
+    meta       = obj.get("metadata", {})
+    uid        = int(meta.get("user_id", 0))
+    plan_label = meta.get("plan_label", "")
 
-    plan = STARS_PLANS_BY_LABEL.get(plan_label)
+    if not uid or not plan_label:
+        row = db.get_pending_payment(payment_id)
+        if row: uid, plan_label = row["telegram_id"], row["plan_label"]
+
+    plan = YK_PLANS_BY_LABEL.get(plan_label)
     if not plan:
-        logger.error(f"Unknown plan_label in successful_payment: {plan_label}")
-        await update.message.reply_text(
-            "⚠️ Оплата прошла, но план не распознан. Обратитесь в поддержку.",
-            reply_markup=back_to_menu_keyboard(),
+        logger.error(f"YK webhook: unknown plan {plan_label}"); return web.Response(status=200, text="OK")
+
+    if db.is_payment_processed(payment_id):
+        logger.info(f"YK webhook: {payment_id} already done"); return web.Response(status=200, text="OK")
+
+    db.add_subscription(telegram_id=uid, requests_count=plan["requests"], plan_name=plan["name"])
+    db.mark_payment_processed(payment_id)
+    rl = db.get_requests_left(uid)
+    logger.info(f"YK success: user={uid} +{plan['requests']} requests")
+
+    bot_app: Application = request.app["bot_app"]
+    try:
+        await bot_app.bot.send_message(
+            chat_id=uid,
+            text=(
+                f"✅ *Оплата прошла!*\n\n"
+                f"💳 ЮKassa (карта)\n"
+                f"🎁 Начислено: *{plan['requests']} запросов*\n"
+                f"💼 Баланс: *{rl} запросов*\n\n"
+                "Теперь вы можете делать расклады 🔮"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔮 Задать вопрос", callback_data="ask_question")],
+                [InlineKeyboardButton("🎴 Расклады",      callback_data="spreads")],
+                [InlineKeyboardButton("🏠 Главное меню",  callback_data="main_menu")],
+            ]),
+            parse_mode=ParseMode.MARKDOWN,
         )
-        return
+    except Exception as e: logger.warning(f"Notify {uid}: {e}")
+    return web.Response(status=200, text="OK")
 
-    db.add_subscription(telegram_id=user_id, requests_count=plan["requests"], plan_name=plan["name"])
-    requests_left = db.get_requests_left(user_id)
-    logger.info(f"Payment OK: user={user_id} stars={stars_paid} +{plan['requests']} requests")
+# ─────────────────────────── Telegram Stars ──────────────────────────
 
+async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pq = update.pre_checkout_query
+    plan = STARS_PLANS_BY_LABEL.get(pq.invoice_payload)
+    await pq.answer(ok=bool(plan), error_message=None if plan else "Неизвестный план.")
+    if plan: logger.info(f"Stars pre-checkout OK: user={pq.from_user.id} {plan['label']}")
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    p   = update.message.successful_payment
+    uid = update.effective_user.id
+    plan = STARS_PLANS_BY_LABEL.get(p.invoice_payload)
+    if not plan:
+        await update.message.reply_text("⚠️ Оплата прошла, но план не распознан.", reply_markup=back_kb()); return
+    db.add_subscription(telegram_id=uid, requests_count=plan["requests"], plan_name=plan["name"])
+    rl = db.get_requests_left(uid)
+    logger.info(f"Stars OK: user={uid} {p.total_amount}⭐ +{plan['requests']}")
     await update.message.reply_text(
-        f"✅ *Оплата прошла успешно!*\n\n"
-        f"⭐ Вы заплатили: *{stars_paid} звезд*\n"
-        f"🎁 Начислено: *{plan['requests']} запросов*\n"
-        f"💼 Ваш баланс: *{requests_left} запросов*\n\n"
-        "Теперь вы можете делать расклады и задавать вопросы 🔮\n"
-        "Пусть карты ведут вас к истине! ✨",
+        f"✅ *Оплата прошла!*\n\n⭐ Telegram Stars\n⭐ Списано: *{p.total_amount} звезд*\n"
+        f"🎁 Начислено: *{plan['requests']} запросов*\n💼 Баланс: *{rl} запросов*\n\n"
+        "Теперь вы можете делать расклады 🔮",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔮 Задать вопрос", callback_data="ask_question")],
             [InlineKeyboardButton("🎴 Расклады",      callback_data="spreads")],
             [InlineKeyboardButton("🏠 Главное меню",  callback_data="main_menu")],
-        ]),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        ]), parse_mode=ParseMode.MARKDOWN)
 
+# ─────────────────────────── Карта дня ───────────────────────────────
 
-# ── Карта дня ───────────────────────────────────────────────────────
+async def handle_card_of_day(q, uid):
+    if db.already_picked_card_today(uid):
+        info = db.get_card_of_day_info(uid)
+        await q.edit_message_text(
+            f"🌅 *Карта дня*\n\nВы уже выбрали карту сегодня: *{info.get('card_of_day_card','?')}* 🃏\n\n"
+            "Карта дня обновляется в *12:00 МСК*. Приходите завтра! ✨",
+            reply_markup=back_kb(), parse_mode=ParseMode.MARKDOWN); return
+    if db.already_started_card_today(uid):
+        pending = db.get_pending_cards(uid)
+        await q.edit_message_text(
+            "🌅 *Карта дня*\n\nВыберите одну из трёх карт 🔮\n\n👇 *Выберите:*",
+            reply_markup=cod_kb(), parse_mode=ParseMode.MARKDOWN); return
+    pending = draw_cards(3)
+    db.set_card_of_day_pending(uid, [{"name": c["name"], "element": c["element"], "keywords": c["keywords"]} for c in pending])
+    await q.edit_message_text(
+        "🌅 *Карта дня*\n\nТри закрытые карты. Прислушайтесь к интуиции и выберите одну 🔮\n\n👇 *Выберите:*",
+        reply_markup=cod_kb(), parse_mode=ParseMode.MARKDOWN)
 
-async def handle_card_of_day(query, user_id: int):
-    if db.already_picked_card_today(user_id):
-        info = db.get_card_of_day_info(user_id)
-        card_name = info.get("card_of_day_card", "неизвестна")
-        await query.edit_message_text(
-            f"🌅 *Карта дня*\n\nВы уже выбрали карту сегодня: *{card_name}* 🃏\n\n"
-            "Карта дня обновляется ежедневно в *12:00 по Москве*.\n"
-            "Приходите завтра за новым посланием! ✨",
-            reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    if db.already_started_card_today(user_id):
-        pending_cards = db.get_pending_cards(user_id)
-        await query.edit_message_text(
-            "🌅 *Карта дня*\n\nВы уже начали выбор. Выберите одну из трёх закрытых карт 🔮\n\n👇 *Выберите карту:*",
-            reply_markup=card_of_day_keyboard(pending_cards), parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    pending_cards = draw_cards(3)
-    pending_data = [{"name": c["name"], "element": c["element"], "keywords": c["keywords"]} for c in pending_cards]
-    db.set_card_of_day_pending(user_id, pending_data)
-    await query.edit_message_text(
-        "🌅 *Карта дня*\n\n"
-        "Перед вами три закрытые карты. "
-        "Сосредоточьтесь, прислушайтесь к своей интуиции "
-        "и выберите ту, что привлекает вас сильнее всего 🔮\n\n"
-        "👇 *Выберите карту:*",
-        reply_markup=card_of_day_keyboard(pending_cards), parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def handle_pick_card(query, user_id: int, card_index: int, context):
-    pending_cards = db.get_pending_cards(user_id)
-    if not pending_cards or card_index >= len(pending_cards):
-        await query.edit_message_text("⚠️ Ошибка. Начните выбор карты дня заново.", reply_markup=back_to_menu_keyboard())
-        return
-
-    chosen_card = pending_cards[card_index]
-    db.choose_card_of_day(user_id, chosen_card)
-    await query.edit_message_text(f"🎴 *Вы выбрали карту {card_index + 1}!*\n\n⏳ Карта открывается...", parse_mode=ParseMode.MARKDOWN)
-
+async def handle_pick_card(q, uid, idx):
+    pending = db.get_pending_cards(uid)
+    if not pending or idx >= len(pending):
+        await q.edit_message_text("⚠️ Ошибка. Начните выбор заново.", reply_markup=back_kb()); return
+    chosen = pending[idx]
+    db.choose_card_of_day(uid, chosen)
+    await q.edit_message_text(f"🎴 *Карта {idx+1} выбрана!*\n\n⏳ Открывается...", parse_mode=ParseMode.MARKDOWN)
     try:
-        interpretation = groq_client.interpret_card_of_day(chosen_card)
-        card_text = (
-            f"🌅 *Ваша карта дня: {chosen_card['name']}*\n"
-            f"Стихия: {chosen_card['element']}\n\n{'─' * 30}\n\n"
-            f"{interpretation}\n\n{'─' * 30}\n"
-            f"✨ _Пусть этот день будет наполнен светом и мудростью!_"
-        )
+        interp = groq_client.interpret_card_of_day(chosen)
+        text = f"🌅 *Ваша карта дня: {chosen['name']}*\nСтихия: {chosen['element']}\n\n{'─'*30}\n\n{interp}\n\n{'─'*30}\n✨ _Пусть день будет наполнен светом!_"
     except Exception as e:
-        logger.error(f"Groq error in card of day: {e}")
-        card_text = (
-            f"🌅 *Ваша карта дня: {chosen_card['name']}*\n\n"
-            f"Ключевые слова: _{chosen_card['keywords']}_\n\n"
-            "⚠️ Не удалось получить интерпретацию. Попробуйте позже."
-        )
-    await query.edit_message_text(card_text, reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        logger.error(f"Groq COD: {e}")
+        text = f"🌅 *Ваша карта дня: {chosen['name']}*\n\nКлючевые слова: _{chosen['keywords']}_\n\n⚠️ Интерпретация недоступна. Попробуйте позже."
+    await q.edit_message_text(text, reply_markup=back_kb(), parse_mode=ParseMode.MARKDOWN)
 
+# ─────────────────────────── Информация ──────────────────────────────
 
-async def handle_info(query):
-    await query.edit_message_text(
+async def handle_info(q):
+    await q.edit_message_text(
         "ℹ️ *Информация о боте*\n\n"
-        "Я — ваш персональный таро-ассистент на основе ИИ.\n\n"
+        "Персональный таро-ассистент на основе ИИ.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔮 *Возможности:*\n\n"
-        "• *🔮 Задать вопрос* — три карты с интерпретацией ИИ\n"
-        "• *🎴 Расклады* — 10 специализированных раскладов\n"
-        "• *🌅 Карта дня* — бесплатно, каждый день!\n"
-        "• *💳 Подписка* — оплата Telegram Stars ⭐\n\n"
+        "🔮 *Возможности:*\n"
+        "• 🔮 Задать вопрос — расклад из трёх карт\n"
+        "• 🎴 Расклады — 10 тематических раскладов\n"
+        "• 🌅 Карта дня — бесплатно каждый день!\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🎴 *Расклады:*\n"
-        "💕 Отношения  💰 Финансы  🚀 Карьера\n"
-        "⚖️ Да/Нет  🌿 Здоровье  🔮 Будущее\n"
-        "🤔 Решение  🌟 Самопознание  🍀 Удача  ✨ Духовный путь\n\n"
+        "💳 *Тарифы (ЮKassa, картой):*\n"
+        "🌙 99₽ — 3 расклада\n"
+        "⭐ 249₽ — 10 раскладов\n"
+        "🔥 499₽ — 25 раскладов\n"
+        "👑 999₽ — 100 раскладов\n\n"
+        "⭐ *Тарифы (Telegram Stars):*\n"
+        "1 звезда = 100 запросов\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⭐ *Оплата Stars:* 1 звезда = 100 запросов\n"
-        "Запросы накапливаются и не сгорают.\n\n"
         "📬 Уведомления о карте дня — ежедневно в 12:00 МСК.\n\n"
-        "✨ _Таро — инструмент самопознания, а не предсказания судьбы._",
-        reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN,
-    )
+        "✨ _Таро — инструмент самопознания._",
+        reply_markup=back_kb(), parse_mode=ParseMode.MARKDOWN)
 
+# ─────────────────────────── Текстовые сообщения ─────────────────────
 
-# ── Текстовые сообщения ─────────────────────────────────────────────
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state", STATE_IDLE)
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
+    uid   = update.effective_user.id
+    text  = update.message.text.strip()
     if state == STATE_ASK_QUESTION:
-        await handle_user_question(update, context, user_id, text)
+        await handle_user_question(update, context, uid, text)
     elif state == STATE_SPREAD_QUESTION:
-        spread_key = context.user_data.get("current_spread")
-        if not spread_key or spread_key not in SPREADS:
-            await update.message.reply_text("⚠️ Расклад не выбран.", reply_markup=back_to_menu_keyboard())
-            context.user_data["state"] = STATE_IDLE
-            return
-        await handle_spread_question(update, context, user_id, text, spread_key)
+        key = context.user_data.get("current_spread")
+        if not key or key not in SPREADS:
+            await update.message.reply_text("⚠️ Расклад не выбран.", reply_markup=back_kb())
+            context.user_data["state"] = STATE_IDLE; return
+        await handle_spread_question(update, context, uid, text, key)
     else:
-        await update.message.reply_text("Выберите действие в меню 👇", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("Выберите действие 👇", reply_markup=main_menu_keyboard())
 
-
-async def handle_user_question(update, context, user_id, question):
+async def handle_user_question(update, context, uid, question):
     context.user_data["state"] = STATE_IDLE
-    if not db.has_active_subscription(user_id):
-        await update.message.reply_text(
-            "🔒 *У вас нет активной подписки.*\n\nКупите запросы за Telegram Stars.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Купить запросы", callback_data="subscribe")],
-                [InlineKeyboardButton("🏠 Главное меню",   callback_data="main_menu")],
-            ]),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    if not db.use_request(user_id):
-        await update.message.reply_text(
-            "🔒 *Запросы закончились.* Пополните баланс.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Пополнить баланс", callback_data="subscribe")],
-                [InlineKeyboardButton("🏠 Главное меню",     callback_data="main_menu")],
-            ]),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    thinking_msg = await update.message.reply_text(
-        "🔮 *Карты тасуются...*\n\nСосредоточьтесь на своём вопросе...", parse_mode=ParseMode.MARKDOWN,
-    )
-    cards = draw_cards(3)
-    cards_text = format_cards_text(cards)
-    requests_left = db.get_requests_left(user_id)
+    if not db.has_active_subscription(uid):
+        await update.message.reply_text("🔒 *Нет подписки.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Купить", callback_data="subscribe")],[InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN); return
+    if not db.use_request(uid):
+        await update.message.reply_text("🔒 *Запросы закончились.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Пополнить", callback_data="subscribe")],[InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN); return
+    think = await update.message.reply_text("🔮 *Карты тасуются...*", parse_mode=ParseMode.MARKDOWN)
+    cards = draw_cards(3); ct = format_cards_text(cards); rl = db.get_requests_left(uid)
     try:
-        interpretation = groq_client.interpret_three_cards(question, cards)
-        result_text = (
-            f"🔮 *Расклад на ваш вопрос:*\n_«{question}»_\n\n{'─'*30}\n\n"
-            f"🃏 *Выпавшие карты:*\n\n{cards_text}\n\n{'─'*30}\n\n"
-            f"✨ *Интерпретация:*\n\n{interpretation}\n\n{'─'*30}\n"
-            f"_Осталось запросов: {requests_left}_"
-        )
+        interp = groq_client.interpret_three_cards(question, cards)
+        res = f"🔮 *Расклад:*\n_«{question}»_\n\n{'─'*28}\n\n🃏 *Карты:*\n\n{ct}\n\n{'─'*28}\n\n✨ *Интерпретация:*\n\n{interp}\n\n{'─'*28}\n_Осталось: {rl}_"
     except Exception as e:
-        logger.error(f"Groq error: {e}")
-        result_text = (
-            f"🔮 *Расклад на ваш вопрос:*\n_«{question}»_\n\n"
-            f"🃏 *Карты:*\n\n{cards_text}\n\n"
-            f"⚠️ Ошибка интерпретации. Попробуйте снова.\n\n_Осталось: {requests_left}_"
-        )
-    await thinking_msg.delete()
-    await update.message.reply_text(
-        result_text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔮 Ещё вопрос",   callback_data="ask_question")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
-        ]),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        logger.error(f"Groq: {e}"); res = f"🔮 _«{question}»_\n\n{ct}\n\n⚠️ Ошибка. Попробуйте снова.\n_Осталось: {rl}_"
+    await think.delete()
+    await update.message.reply_text(res, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔮 Ещё вопрос", callback_data="ask_question")],[InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN)
 
-
-async def handle_spread_question(update, context, user_id, question, spread_key):
-    context.user_data["state"] = STATE_IDLE
-    context.user_data.pop("current_spread", None)
-    spread = SPREADS[spread_key]
-    if not db.has_active_subscription(user_id):
-        await update.message.reply_text(
-            "🔒 *У вас нет активной подписки.*",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Купить запросы", callback_data="subscribe")],
-                [InlineKeyboardButton("🏠 Главное меню",   callback_data="main_menu")],
-            ]),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    if not db.use_request(user_id):
-        await update.message.reply_text(
-            "🔒 *Запросы закончились.*",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Пополнить", callback_data="subscribe")],
-                [InlineKeyboardButton("🏠 Меню",      callback_data="main_menu")],
-            ]),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    thinking_msg = await update.message.reply_text(
-        f"🎴 *{spread['name']}*\n\nКарты тасуются...", parse_mode=ParseMode.MARKDOWN,
-    )
-    cards = draw_cards(spread["card_count"])
-    cards_text = format_cards_text(cards)
-    requests_left = db.get_requests_left(user_id)
+async def handle_spread_question(update, context, uid, question, key):
+    context.user_data["state"] = STATE_IDLE; context.user_data.pop("current_spread", None)
+    s = SPREADS[key]
+    if not db.has_active_subscription(uid):
+        await update.message.reply_text("🔒 *Нет подписки.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Купить", callback_data="subscribe")],[InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN); return
+    if not db.use_request(uid):
+        await update.message.reply_text("🔒 *Запросы закончились.*", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Пополнить", callback_data="subscribe")],[InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN); return
+    think = await update.message.reply_text(f"🎴 *{s['name']}*\n\nКарты тасуются...", parse_mode=ParseMode.MARKDOWN)
+    cards = draw_cards(s["card_count"]); ct = format_cards_text(cards); rl = db.get_requests_left(uid)
     try:
-        interpretation = groq_client.interpret_spread(
-            spread_name=spread["name"], question=question, cards=cards, positions=spread["positions"]
-        )
-        positions_display = "\n".join([
-            f"*{i+1}. {spread['positions'][i]}*\n   🃏 {cards[i]['name']}"
-            for i in range(len(cards))
-        ])
-        result_text = (
-            f"{spread['emoji']} *{spread['name']}*\n_«{question}»_\n\n{'─'*30}\n\n"
-            f"🃏 *Карты расклада:*\n\n{positions_display}\n\n{'─'*30}\n\n"
-            f"✨ *Полная интерпретация:*\n\n{interpretation}\n\n{'─'*30}\n"
-            f"_Осталось запросов: {requests_left}_"
-        )
+        interp = groq_client.interpret_spread(spread_name=s["name"], question=question, cards=cards, positions=s["positions"])
+        pos = "\n".join([f"*{i+1}. {s['positions'][i]}*\n   🃏 {cards[i]['name']}" for i in range(len(cards))])
+        res = f"{s['emoji']} *{s['name']}*\n_«{question}»_\n\n{'─'*28}\n\n🃏 *Карты:*\n\n{pos}\n\n{'─'*28}\n\n✨ *Интерпретация:*\n\n{interp}\n\n{'─'*28}\n_Осталось: {rl}_"
     except Exception as e:
-        logger.error(f"Groq spread error: {e}")
-        result_text = (
-            f"{spread['emoji']} *{spread['name']}*\n_«{question}»_\n\n"
-            f"🃏 *Карты:*\n\n{cards_text}\n\n"
-            f"⚠️ Ошибка интерпретации. Попробуйте снова.\n\n_Осталось: {requests_left}_"
-        )
-    await thinking_msg.delete()
-    await update.message.reply_text(
-        result_text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎴 Ещё расклад",   callback_data="spreads")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
-        ]),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        logger.error(f"Groq spread: {e}"); res = f"{s['emoji']} *{s['name']}*\n_«{question}»_\n\n{ct}\n\n⚠️ Ошибка.\n_Осталось: {rl}_"
+    await think.delete()
+    await update.message.reply_text(res, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎴 Ещё расклад", callback_data="spreads")],[InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]]), parse_mode=ParseMode.MARKDOWN)
 
+# ─────────────────────────── Уведомления ─────────────────────────────
 
-# ── Уведомления ─────────────────────────────────────────────────────
-
-async def send_daily_notifications(app):
-    logger.info("Отправка уведомлений о карте дня...")
-    success = errors = 0
-    for telegram_id in db.get_all_user_ids():
+async def daily_notify(app: Application):
+    logger.info("Рассылка карты дня...")
+    ok = err = 0
+    for tid in db.get_all_user_ids():
         try:
             await app.bot.send_message(
-                chat_id=telegram_id,
-                text="🌅 *Карта дня обновлена!*\n\nВаша ежедневная карта Таро готова ✨\nВыберите карту, которая говорит с вашей душой:",
+                chat_id=tid,
+                text="🌅 *Карта дня обновлена!*\n\nВаша карта Таро готова ✨ Выберите одну из трёх:",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌅 Открыть карту дня", callback_data="card_of_day")]]),
                 parse_mode=ParseMode.MARKDOWN,
             )
-            success += 1
-        except Exception as e:
-            logger.warning(f"Уведомление {telegram_id}: {e}")
-            errors += 1
-    logger.info(f"Уведомления: {success} OK, {errors} ошибок")
+            ok += 1
+        except Exception as e: logger.warning(f"Notify {tid}: {e}"); err += 1
+    logger.info(f"Рассылка: {ok} OK, {err} ошибок")
 
+# ─────────────────────────── Запуск ──────────────────────────────────
 
-# ── Запуск ──────────────────────────────────────────────────────────
+async def start_webhook_server(app: Application):
+    web_app = web.Application()
+    web_app["bot_app"] = app
+    web_app.router.add_post("/yookassa/webhook", yookassa_webhook)
+    web_app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
+    logger.info(f"Webhook-сервер запущен: порт {WEBHOOK_PORT}")
 
 def main():
-    if not TOKEN:
-        raise ValueError("TELEGRAM_TOKEN не задан")
-
+    if not TOKEN: raise ValueError("TELEGRAM_TOKEN не задан")
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu",  start))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-
-    # ---- Telegram Stars Payments ----
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    # ---------------------------------
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
 
     scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
-    scheduler.add_job(send_daily_notifications, trigger="cron", hour=12, minute=0, args=[app])
+    scheduler.add_job(daily_notify, "cron", hour=12, minute=0, args=[app])
     scheduler.start()
     logger.info("Планировщик 12:00 МСК запущен")
 
+    app.post_init = start_webhook_server
+
     logger.info("🔮 Таро-бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
